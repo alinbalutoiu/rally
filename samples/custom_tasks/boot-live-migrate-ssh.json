@@ -1,0 +1,35 @@
+{% set flavor_name = flavor_name or "m1.tiny" %}
+{% set image = image or "^cirros.*uec$" %}
+{
+   "NovaServers.boot_live_migrate_ssh_server": [
+        {
+            "args": {
+                "flavor": {
+                    "name": "{{flavor_name}}"
+                },
+                "image": {
+                    "name": "{{image}}"
+                },
+                "block_migration": false,
+                "availability_zone": "nova:<hostname>",
+                "force_delete": false,
+                "host_to_migrate": "<host_to_migrate>",
+                "floating_network": "public",
+                "image_ssh_user": "cirros"
+            },
+            "runner": {
+                "type": "constant",
+                "times": 10,
+                "concurrency": 2
+            },
+            "context": {
+                "users": {
+                    "tenants": 2,
+                    "users_per_tenant": 3
+                },
+                "network": {
+                }
+            }
+        }
+    ]
+}
