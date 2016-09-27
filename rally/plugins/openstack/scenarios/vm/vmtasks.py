@@ -274,140 +274,35 @@ class RuncommandHeat(vm_utils.VMScenario):
                           "rows": rows}}
         )
 
-BASH_DD_LOAD_TEST = """
-#!/bin/sh
-# Load server and output JSON results ready to be processed
-# by Rally scenario
-
-for ex in awk top grep free tr df dc dd gzip
-do
-    if ! type ${ex} >/dev/null
-    then
-        echo "Executable is required by script but not available\
-         on a server: ${ex}" >&2
-        return 1
-    fi
-done
-
-get_used_cpu_percent() {
-    echo 100\
-     $(top -b -n 1 | grep -i CPU | head -n 1 | awk '{print $8}' | tr -d %)\
-      - p | dc
-}
-
-get_used_ram_percent() {
-    local total=$(free | grep Mem: | awk '{print $2}')
-    local used=$(free | grep -- -/+\ buffers | awk '{print $3}')
-    echo ${used} 100 \* ${total} / p | dc
-}
-
-get_used_disk_percent() {
-    df -P / | grep -v Filesystem | awk '{print $5}' | tr -d %
-}
-
-get_seconds() {
-    (time -p ${1}) 2>&1 | awk '/real/{print $2}'
-}
-
-complete_load() {
-    local script_file=${LOAD_SCRIPT_FILE:-/tmp/load.sh}
-    local stop_file=${LOAD_STOP_FILE:-/tmp/load.stop}
-    local processes_num=${LOAD_PROCESSES_COUNT:-20}
-    local size=${LOAD_SIZE_MB:-5}
-
-    cat << EOF > ${script_file}
-until test -e ${stop_file}
-do dd if=/dev/urandom bs=1M count=${size} 2>/dev/null | gzip >/dev/null ; done
-EOF
-
-    local sep
-    local cpu
-    local ram
-    local dis
-    rm -f ${stop_file}
-    for i in $(seq ${processes_num})
-    do
-        i=$((i-1))
-        sh ${script_file} &
-        cpu="${cpu}${sep}[${i}, $(get_used_cpu_percent)]"
-        ram="${ram}${sep}[${i}, $(get_used_ram_percent)]"
-        dis="${dis}${sep}[${i}, $(get_used_disk_percent)]"
-        sep=", "
-    done
-    > ${stop_file}
-    cat << EOF
-    {
-      "title": "Generate load by spawning processes",
-      "description": "Each process runs gzip for ${size}M urandom data\
-       in a loop",
-      "chart_plugin": "Lines",
-      "axis_label": "Number of processes",
-      "label": "Usage, %",
-      "data": [
-        ["CPU", [${cpu}]],
-        ["Memory", [${ram}]],
-        ["Disk", [${dis}]]]
-    }
-EOF
-}
-
-additive_dd() {
-    local c=${1:-50} # Megabytes
-    local file=/tmp/dd_test.img
-    local write=$(get_seconds "dd if=/dev/urandom of=${file} bs=1M count=${c}")
-    local read=$(get_seconds "dd if=${file} of=/dev/null bs=1M count=${c}")
-    local gzip=$(get_seconds "gzip ${file}")
-    rm ${file}.gz
-    cat << EOF
-    {
-      "title": "Write, read and gzip file",
-      "description": "Using file '${file}', size ${c}Mb.",
-      "chart_plugin": "StackedArea",
-      "data": [
-        ["write_${c}M", ${write}],
-        ["read_${c}M", ${read}],
-        ["gzip_${c}M", ${gzip}]]
-    },
-    {
-      "title": "Statistics for write/read/gzip",
-      "chart_plugin": "StatsTable",
-      "data": [
-        ["write_${c}M", ${write}],
-        ["read_${c}M", ${read}],
-        ["gzip_${c}M", ${gzip}]]
-    }
-
-EOF
-}
-
-cat << EOF
-{
-  "additive": [$(additive_dd)],
-  "complete": [$(complete_load)]
-}
-EOF
-"""
-
 
 @types.convert(image={"type": "glance_image"},
                flavor={"type": "nova_flavor"})
 @validation.image_valid_on_flavor("flavor", "image")
-@validation.valid_command("command")
-@validation.number("port", minval=1, maxval=65535, nullable=True,
-                   integer_only=True)
 @validation.external_network_exists("floating_network")
-@validation.required_services(consts.Service.NOVA, consts.Service.CINDER)
+@validation.required_services(consts.Service.NOVA, consts.Service.NEUTRON)
 @validation.required_openstack(users=True)
-@scenario.configure(context={"cleanup": ["nova", "cinder"],
-                             "keypair": {}, "allow_ssh": None},
-                    name="VMTasks.dd_load_test")
-class DDLoadTest(BootRuncommandDelete):
+@scenario.configure(context={"cleanup": ["nova"], "keypair": {},
+                             "allow_ssh": None},
+                    name="VMTasks.boot_ssh_delete_server")
+class BootSSHDeleteServer(vm_utils.VMScenario):
 
-    def run(self, command, **kwargs):
-        """Boot a server from a custom image, run a command that outputs JSON.
+    def __init__(self, *args, **kwargs):
+        super(BootSSHDeleteServer, self).__init__(*args, **kwargs)
 
-        Example Script in rally-jobs/extra/install_benchmark.sh
-        :param command: default parameter from scenario
-        """
-        command["script_inline"] = BASH_DD_LOAD_TEST
-        return super(DDLoadTest, self).run(command=command, **kwargs)
+    def run(self, image, flavor, username, password=None,
+            floating_network=None, port=22, use_floating_ip=True,
+            force_delete=False, wait_for_ping=True,
+            max_log_length=None, **kwargs):
+        """Boots a server and waits for SSH connection."""
+        server, fip = self._boot_server_with_fip(
+            image, flavor, use_floating_ip=use_floating_ip,
+            floating_network=floating_network,
+            key_name=self.context["user"]["keypair"]["name"],
+            **kwargs)
+
+        pkey = self.context["user"]["keypair"]["private"]
+        ssh = sshutils.SSH(username, fip["ip"], port=port,
+                           pkey=pkey, password=password)
+        self._wait_for_ssh(ssh)
+
+        self._delete_server_with_fip(server, fip, force_delete=force_delete)
