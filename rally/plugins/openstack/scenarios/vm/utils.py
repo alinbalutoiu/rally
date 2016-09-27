@@ -20,6 +20,9 @@ import sys
 import netaddr
 from oslo_config import cfg
 import six
+import winrm
+import time
+import tempfile
 
 from rally.common.i18n import _
 from rally.common import logging
@@ -53,7 +56,7 @@ class Host(object):
 
     def __init__(self, ip):
         self.ip = netaddr.IPAddress(ip)
-        self.status = self.ICMP_DOWN_STATUS
+        self.status = self.Host.ICMP_DOWN_STATUS
 
     @property
     def id(self):
@@ -75,9 +78,9 @@ class Host(object):
         LOG.debug("Host %s is ICMP %s"
                   % (server.ip.format(), proc.returncode and "down" or "up"))
         if proc.returncode == 0:
-            server.status = cls.ICMP_UP_STATUS
+            server.status = cls.Host.ICMP_UP_STATUS
         else:
-            server.status = cls.ICMP_DOWN_STATUS
+            server.status = cls.Host.ICMP_DOWN_STATUS
         return server
 
     def __eq__(self, other):
@@ -207,7 +210,7 @@ class VMScenario(nova_utils.NovaScenario, cinder_utils.CinderScenario):
         server = Host(server_ip)
         utils.wait_for_status(
             server,
-            ready_statuses=[Host.ICMP_UP_STATUS],
+            ready_statuses=[Host.Host.ICMP_UP_STATUS],
             update_resource=Host.update_status,
             timeout=CONF.benchmark.vm_ping_timeout,
             check_interval=CONF.benchmark.vm_ping_poll_interval
@@ -240,3 +243,214 @@ class VMScenario(nova_utils.NovaScenario, cinder_utils.CinderScenario):
                            pkey=pkey, password=password)
         self._wait_for_ssh(ssh, timeout, interval)
         return self._run_command_over_ssh(ssh, command)
+
+    @staticmethod
+    def _ping_ip_address(host):
+        """Check ip address that it is pingable.
+
+        :param host: instance of `netaddr.IPAddress`
+        """
+        ping = "ping" if host.version == 4 else "ping6"
+        if sys.platform.startswith("linux"):
+            cmd = [ping, "-c1", "-w1", str(host)]
+        else:
+            cmd = [ping, "-c1", str(host)]
+
+        proc = subprocess.Popen(cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        proc.wait()
+        LOG.debug("Host %s is ICMP %s"
+                  % (host, proc.returncode and "down" or "up"))
+        return (Host.ICMP_UP_STATUS if (proc.returncode == 0)
+                else Host.ICMP_DOWN_STATUS)
+
+    @atomic.action_timer("vm._wait_for_ping")
+    def _wait_for_ping_windows(self, server_ip):
+        server_ip = netaddr.IPAddress(server_ip)
+        utils.wait_for(
+            server_ip,
+            ready_statuses=[Host.Host.ICMP_UP_STATUS],
+            update_resource=Host.update_status,
+            timeout=CONF.benchmark.vm_ping_timeout,
+            check_interval=CONF.benchmark.vm_ping_poll_interval
+        )
+        utils.wait_for(
+            server_ip,
+            ready_statuses=[Host.Host.ICMP_DOWN_STATUS],
+            update_resource=Host.update_status,
+            timeout=CONF.benchmark.vm_ping_timeout,
+            check_interval=CONF.benchmark.vm_ping_poll_interval
+        )
+        utils.wait_for(
+            server_ip,
+            ready_statuses=[Host.Host.ICMP_UP_STATUS],
+            update_resource=Host.update_status,
+            timeout=CONF.benchmark.vm_ping_timeout,
+            check_interval=CONF.benchmark.vm_ping_poll_interval
+        )
+
+    @atomic.action_timer("vm._wait_for_ping")
+    def _wait_for_ping_linux(self, server_ip):
+        server_ip = netaddr.IPAddress(server_ip)
+        utils.wait_for(
+            server_ip,
+            ready_statuses=[Host.Host.ICMP_UP_STATUS],
+            update_resource=Host.update_status,
+            timeout=CONF.benchmark.vm_ping_timeout,
+            check_interval=CONF.benchmark.vm_ping_poll_interval
+        )
+
+    def _get_windows_password(self, server, private_key, retry_interval):
+        nova_client = self.clients("nova")
+        with tempfile.NamedTemporaryFile() as ntf:
+            ntf.write(private_key)
+            ntf.flush()
+            password = ''
+            while (password == ''):
+                password = nova_client.servers.get_password(server.id,
+                                                            ntf.name)
+                if password != '':
+                    LOG.debug(password)
+                time.sleep(retry_interval)
+            ntf.close()
+        return password
+
+    @atomic.action_timer("vm.wait_for_hadoop_to_start")
+    def _wait_for_hadoop_to_start(self, server_ip, username, os_distro,
+                                  password=None, pkey=None, interval_retry=1,
+                                  retry_count_total=10, port=22):
+
+        if os_distro == 'windows':
+            self.wait_for_hadoop_on_windows(server_ip, username, password,
+                                            interval_retry, retry_count_total)
+        else:
+            self.wait_for_hadoop_on_ubuntu(server_ip, username, pkey, port)
+
+    def wait_for_hadoop_on_ubuntu(self, server_ip, username, pkey, port):
+        command = (
+            "sudo sed -i '0,/localhost/c\\127.0.0.1 "
+            "localhost %(hostname)s' /etc/hosts;"
+            "~/hadoop-2.7.1/bin/hdfs namenode -format;"
+            "~/hadoop-2.7.1/sbin/start-all.sh;"
+            "~/hadoop-2.7.1/bin/hdfs dfsadmin -safemode wait"
+        )
+
+        ssh = sshutils.SSH(username, server_ip, port=port,
+                           pkey=pkey, password=None)
+        ssh.wait()
+
+        _, hostname, _ = ssh.execute('hostname')
+        code, out, err = ssh.execute(command % {'hostname': hostname})
+        if code:
+            raise Exception("Command failed! Check error: %s" % err)
+
+    def wait_for_hadoop_on_windows(self, server_ip, username, password,
+                                   interval_retry=1, retry_count_total=10):
+        session = winrm.Session(server_ip, auth=(username, password),
+                                transport='ssl')
+        retry_count = retry_count_total
+        while True:
+            try:
+                session.run_ps("ls")
+                LOG.debug("WinRM is UP")
+                break
+            except Exception:
+                if retry_count == 0:
+                    raise
+                retry_count = retry_count - 1
+                LOG.debug("Winrm is down")
+                time.sleep(interval_retry)
+
+        retry_count = retry_count_total
+        cmd_register_task = (
+            'Start-Process powershell -wait -verb runas '
+            '\'$dom = "$env:USERDOMAIN";$usr="$env:USERNAME";'
+            '$Sta = New-ScheduledTaskAction -Execute "start-all.cmd";'
+            'Register-ScheduledTask -TaskName "HadoopTest" -Action $Sta '
+            '-User $dom\$usr -Password %s -RunLevel Highest\'' % password
+        )
+        LOG.debug(cmd_register_task)
+        LOG.debug(session.run_ps(cmd_register_task).std_out)
+        cmd = 'Start-ScheduledTask -TaskName "\HadoopTest"'
+        while True:
+            try:
+                session.run_ps(cmd)
+                LOG.debug("Hadoop starting...")
+                break
+            except Exception:
+                if retry_count == 0:
+                    raise
+                retry_count = retry_count - 1
+                LOG.debug("Winrm is down")
+                time.sleep(interval_retry)
+
+        retry_count = retry_count_total
+        cmd = "hdfs dfsadmin -safemode wait"
+        while True:
+            try:
+                output = session.run_ps(cmd)
+                LOG.debug(output.std_out)
+                LOG.debug(output.std_err)
+                if output.std_err.find("Connection refused") < 0:
+                    break
+            except Exception:
+                if retry_count == 0:
+                    raise
+                retry_count = retry_count - 1
+                LOG.debug("Hadoop is not ready yet")
+                time.sleep(interval_retry)
+
+    def _run_job_winrm(self, job_idx, server_ip, username, password,
+                       command, retry_count=3, interval=1):
+        session = winrm.Session(server_ip, auth=(username, password),
+                                transport='ssl')
+
+        @atomic.action_timer("vm.job_execution_%s" % job_idx)
+        def run(self):
+            retry = retry_count
+            success_filter = "completed successfully"
+            while True:
+                try:
+                    LOG.debug("Running job: %s" % command)
+                    result = session.run_ps(command)
+                    LOG.debug(result.std_err)
+                    if result.std_err.find(success_filter) < 0:
+                        return False
+                    LOG.debug("Job completed succesfully #%d" % job_idx)
+                    return True
+                except Exception:
+                    if retry == 0:
+                        raise
+                    retry = retry - 1
+                    time.sleep(interval)
+
+        run(self)
+
+    def _run_job_ssh(self, job_idx, server_ip, username, private_key,
+                     command, retry_count=3, interval=1):
+        ssh = sshutils.SSH(username, server_ip, port=22,
+                           pkey=private_key, password=None)
+        ssh.wait()
+
+        @atomic.action_timer("vm.job_execution_%s" % job_idx)
+        def run(self):
+            retry = retry_count
+            success_filter = "completed successfully"
+            while True:
+                try:
+                    LOG.debug("Running job: %s" % command)
+                    code, out, err = ssh.execute(command)
+                    LOG.debug(err)
+                    if err.find(success_filter) < 0:
+                        return False
+                    LOG.debug("Job completed succesfully #%d" % job_idx)
+                    return True
+                except Exception:
+                    if retry == 0:
+                        raise
+                    retry = retry - 1
+                    time.sleep(interval)
+
+        run(self)
+
