@@ -16,11 +16,13 @@
 import jsonschema
 
 from rally.common import logging
+from rally.common import sshutils
 from rally import consts
 from rally import exceptions as rally_exceptions
 from rally.plugins.openstack import scenario
 from rally.plugins.openstack.scenarios.cinder import utils as cinder_utils
 from rally.plugins.openstack.scenarios.nova import utils
+from rally.plugins.openstack.scenarios.vm import utils as vm_utils
 from rally.plugins.openstack.wrappers import network as network_wrapper
 from rally.task import types
 from rally.task import utils as task_utils
@@ -29,7 +31,8 @@ from rally.task import validation
 LOG = logging.getLogger(__name__)
 
 
-class NovaServers(utils.NovaScenario,
+class NovaServers(vm_utils.VMScenario,
+                  utils.NovaScenario,
                   cinder_utils.CinderScenario):
     """Benchmark scenarios for Nova servers."""
 
@@ -667,6 +670,60 @@ class NovaServers(utils.NovaScenario,
         new_host = self._find_host_to_migrate(server)
         self._live_migrate(server, new_host,
                            block_migration, disk_over_commit)
+
+        self._delete_server(server)
+
+    @types.convert(image={"type": "glance_image"},
+                   flavor={"type": "nova_flavor"})
+    @validation.image_valid_on_flavor("flavor", "image")
+    @validation.required_services(consts.Service.NOVA)
+    @validation.required_openstack(admin=True, users=True)
+    @scenario.configure(context={"cleanup": ["nova"]})
+    def boot_live_migrate_ssh_server(self, image, image_ssh_user,
+                                     flavor, floating_network,
+                                     block_migration=False,
+                                     disk_over_commit=False, min_sleep=0,
+                                     max_sleep=0, availability_zone=None,
+                                     host_to_migrate=None, **kwargs):
+        """Live Migrate a server.
+
+        This scenario launches a VM on a compute node available in
+        the availability zone and then migrates the VM to another
+        compute node on the same availability zone.
+
+        Optional 'min_sleep' and 'max_sleep' parameters allow the scenario
+        to simulate a pause between VM booting and running live migration
+        (of random duration from range [min_sleep, max_sleep]).
+
+        :param image: image to be used to boot an instance
+        :param flavor: flavor to be used to boot an instance
+        :param block_migration: Specifies the migration type
+        :param disk_over_commit: Specifies whether to allow overcommit
+                                 on migrated instance or not
+        :param min_sleep: Minimum sleep time in seconds (non-negative)
+        :param max_sleep: Maximum sleep time in seconds (non-negative)
+        :param availability_zone: The host where the VM is initially booted
+        :param host_to_migrate: The host where the VM will be migrated
+        :param kwargs: Optional additional arguments for server creation
+        """
+        if availability_zone is not None:
+            kwargs['availability_zone'] = availability_zone
+
+        server, fip = self._boot_server_with_fip(
+            image, flavor, floating_network=floating_network, **kwargs)
+        self.sleep_between(min_sleep, max_sleep)
+
+        pkey = self.context["user"]["keypair"]["private"]
+        ssh_client = sshutils.SSH(image_ssh_user, fip['ip'], pkey=pkey)
+        ssh_client.wait()
+
+        new_host = self._find_host_to_migrate(server,
+                                              requested_host=host_to_migrate)
+
+        self._live_migrate(server, new_host,
+                           block_migration, disk_over_commit)
+        ssh_client = sshutils.SSH(image_ssh_user, fip['ip'], pkey=pkey)
+        ssh_client.wait()
 
         self._delete_server(server)
 
