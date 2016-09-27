@@ -301,7 +301,7 @@ class VMScenario(nova_utils.NovaScenario, cinder_utils.CinderScenario):
             check_interval=CONF.benchmark.vm_ping_poll_interval
         )
 
-    def _get_windows_password(self, server, private_key, retry_interval):
+    def _get_windows_password(self, server, private_key, retry_interval=1):
         nova_client = self.clients("nova")
         with tempfile.NamedTemporaryFile() as ntf:
             ntf.write(private_key)
