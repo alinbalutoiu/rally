@@ -60,6 +60,27 @@ class NovaServers(utils.NovaScenario,
         self._boot_server(image, flavor, **kwargs)
         self._list_servers(detailed)
 
+    @types.convert(image={"type": "glance_image"},
+                   flavor={"type": "nova_flavor"})
+    @validation.image_valid_on_flavor("flavor", "image")
+    @validation.required_services(consts.Service.NOVA)
+    @validation.required_openstack(users=True)
+    @scenario.configure(context={"cleanup": ["nova"]})
+    def boot_and_check_console_log_server(self, image, flavor,
+                                          detailed=True, **kwargs):
+        server = self._boot_server(image, flavor, **kwargs)
+        console_log = self.clients("nova").servers.get_console_output
+        retries = 0
+
+        while console_log(server.id) == '' and retries < 20:
+            retries = retries + 1
+            self.sleep_between(1, 1)
+            if retries == 19:
+                raise Exception("Timeout waiting for the console!")
+        print console_log(server.id)[0:50]
+
+        self._delete_server(server, force=False)
+
     @validation.required_services(consts.Service.NOVA)
     @validation.required_openstack(users=True)
     @scenario.configure(context={"cleanup": ["nova"]})
