@@ -737,7 +737,7 @@ class NovaScenario(scenario.OpenStackScenario):
                 host_pre_migrate)
 
     @atomic.action_timer("nova.find_host_to_migrate")
-    def _find_host_to_migrate(self, server):
+    def _find_host_to_migrate(self, server, requested_host=None):
         """Find a compute node for live migration.
 
         :param server: Server object
@@ -751,11 +751,18 @@ class NovaScenario(scenario.OpenStackScenario):
                 az = a
                 break
         try:
-            new_host = random.choice(
-                [key for key, value in az.hosts.items()
-                    if key != host and
-                    value.get("nova-compute", {}).get("available", False)])
-            return new_host
+            if not requested_host:
+                new_host = random.choice(
+                    [key for key, value in az.hosts.items()
+                        if key != host and
+                        value.get("nova-compute", {}).get("available", False)])
+                return new_host
+            else:
+                new_host = random.choice(
+                    [key for key, value in az.hosts.items()
+                        if key.upper() == host.upper() and
+                        value.get("nova-compute", {}).get("available", False)])
+                return new_host
         except IndexError:
             raise exceptions.InvalidHostException(
                 "No valid host found to migrate")
